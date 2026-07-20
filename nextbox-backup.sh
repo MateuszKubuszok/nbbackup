@@ -42,6 +42,23 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 # Run curl inside the relay container so the daemon sees an authorized source IP.
 nbcurl() { docker exec "$CONTAINER" curl "$@"; }
 
+# The daemon reports which part of the backup is running in the status "who"
+# field (desc[0] from full_export() in the daemon's raw_backup_restore.py).
+# Map each to a human label. Backup runs these parts in this order:
+#   sql -> data -> apps -> nextbox -> config -> letsencrypt
+describe_who() {
+    case "$1" in
+        all)         echo "overall" ;;
+        sql)         echo "database dump" ;;
+        data)        echo "Nextcloud files (data/)" ;;
+        apps)        echo "installed apps (custom_apps/)" ;;
+        nextbox)     echo "NextBox system config" ;;
+        config)      echo "Nextcloud config" ;;
+        letsencrypt) echo "TLS certificates" ;;
+        *)           echo "$1" ;;
+    esac
+}
+
 # Preflight: the relay container must be up (this also verifies docker is usable).
 if ! docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -qx true; then
     log "ERROR: container '$CONTAINER' is not running (or docker is not accessible); cannot reach the local Nextbox daemon" >&2
@@ -64,31 +81,39 @@ fi
 
 log "Backup triggered successfully"
 
+# Each part moves through state: starting -> active -> finished; the overall
+# run ends in "completed". Between a part's "finished" and the next part's
+# "active" the daemon runs a blocking `rsync --dry-run` to count files and
+# pushes no status update, so the status legitimately sits at the previous
+# part's "finished/100" for minutes on a large data/ tree -- that is the
+# daemon counting files, not a stall.
 ELAPSED=0
 while [ $ELAPSED -lt $TIMEOUT ]; do
     sleep $INTERVAL
     ELAPSED=$((ELAPSED + INTERVAL))
 
     STATUS=$(nbcurl -sf "$DAEMON/backup/status" 2>/dev/null || echo '{}')
-    STATE=$(echo "$STATUS" | python3 -c "
+    # Parse state, who (current part) and percent in one shot; "idle" == no
+    # backup on the board (data is null).
+    PARSED=$(echo "$STATUS" | python3 -c "
 import sys, json
 d = json.load(sys.stdin).get('data')
-print(d.get('state', 'unknown') if d else 'idle')
-" 2>/dev/null || echo "unknown")
+if not d:
+    print('idle ? ?')
+else:
+    print(d.get('state', 'unknown'), d.get('who', '?'), d.get('percent', '?'))
+" 2>/dev/null || echo "unknown ? ?")
+    read -r STATE WHO PERCENT <<<"$PARSED"
+    WHO_DESC=$(describe_who "$WHO")
 
     case "$STATE" in
         completed)
-            log "Backup completed successfully"
+            log "Backup completed successfully (all parts exported)"
             nbcurl -sf "$DAEMON/backup/status/clear" > /dev/null 2>&1 || true
             exit 0
             ;;
         failed)
-            WHO=$(echo "$STATUS" | python3 -c "
-import sys, json
-d = json.load(sys.stdin).get('data', {})
-print(d.get('who', 'unknown'))
-" 2>/dev/null || echo "unknown")
-            log "ERROR: Backup failed during: $WHO" >&2
+            log "ERROR: Backup FAILED while backing up ${WHO_DESC} (who=$WHO)" >&2
             nbcurl -sf "$DAEMON/backup/status/clear" > /dev/null 2>&1 || true
             exit 1
             ;;
@@ -98,12 +123,24 @@ print(d.get('who', 'unknown'))
             ;;
     esac
 
-    PERCENT=$(echo "$STATUS" | python3 -c "
-import sys, json
-d = json.load(sys.stdin).get('data', {})
-print(d.get('percent', '?'))
-" 2>/dev/null || echo "?")
-    log "In progress: state=$STATE percent=$PERCENT elapsed=${ELAPSED}s"
+    # Human-readable progress line, driven by the (state, who) pair.
+    case "$STATE" in
+        starting)
+            MSG="starting up (dumping database first)" ;;
+        active)
+            if [ "$PERCENT" = "100" ]; then
+                MSG="backing up ${WHO_DESC} (~100%; the estimate saturates on incremental syncs, still transferring)"
+            else
+                MSG="backing up ${WHO_DESC} (${PERCENT}%)"
+            fi ;;
+        finished)
+            MSG="finished ${WHO_DESC}; preparing next part (scanning files, no status update meanwhile)" ;;
+        inactive)
+            MSG="preparing ${WHO_DESC}" ;;
+        *)
+            MSG="${WHO_DESC}: state=${STATE} percent=${PERCENT}" ;;
+    esac
+    log "In progress: ${MSG} — elapsed ${ELAPSED}s"
 done
 
 log "ERROR: Backup timed out after ${TIMEOUT}s" >&2

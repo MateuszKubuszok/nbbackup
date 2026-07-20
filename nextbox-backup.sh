@@ -21,10 +21,14 @@
 # Usage:
 #   nextbox-backup.sh [TAR_PATH]
 #
-# TAR_PATH defaults to /media/NextBoxHardDisk/scheduled_backup and must live
-# under a mounted Nextbox backup device, or the daemon rejects it.
+# TAR_PATH defaults to /media/extra-1/nc_backup and must live under a mounted
+# Nextbox backup device, or the daemon rejects it.
 # Discover devices / existing backups with:
 #   docker exec nextbox-compose_app_1 curl http://172.18.238.1:18585/backup
+#
+# On success, if the off-site sync script (nextbox-offsite.sh) is installed and
+# executable, this hands off to it to push the refreshed mirror to pCloud. Set
+# OFFSITE_SCRIPT= (empty) to disable that hand-off.
 #
 # Schedule with crontab -e (root):
 #   0 3 * * * /usr/local/bin/nextbox-backup.sh >> /var/log/nextbox-backup-cron.log 2>&1
@@ -33,7 +37,7 @@ set -euo pipefail
 
 DAEMON="http://172.18.238.1:18585"        # daemon, as seen from inside the docker network
 CONTAINER="nextbox-compose_app_1"         # running container on nextbox-compose_default (172.18.238.0/24)
-TAR_PATH="${1:-/media/NextBoxHardDisk/scheduled_backup}"
+TAR_PATH="${1:-/media/extra-1/nc_backup}"
 TIMEOUT=21600  # 6 hours
 INTERVAL=30
 
@@ -41,6 +45,20 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 # Run curl inside the relay container so the daemon sees an authorized source IP.
 nbcurl() { docker exec "$CONTAINER" curl "$@"; }
+
+# After a successful local backup, hand off to the off-site sync if installed.
+# A failure there is logged loudly but does NOT fail the local backup, which has
+# already succeeded; the off-site sync is resumable and retries every night.
+OFFSITE_SCRIPT="${OFFSITE_SCRIPT-/usr/local/bin/nextbox-offsite.sh}"
+run_offsite() {
+    [ -n "$OFFSITE_SCRIPT" ] && [ -x "$OFFSITE_SCRIPT" ] || return 0
+    log "Handing off to off-site sync: $OFFSITE_SCRIPT"
+    if "$OFFSITE_SCRIPT"; then
+        log "Off-site sync completed"
+    else
+        log "WARNING: off-site sync failed (exit $?); local backup is intact, will retry next run" >&2
+    fi
+}
 
 # The daemon reports which part of the backup is running in the status "who"
 # field (desc[0] from full_export() in the daemon's raw_backup_restore.py).
@@ -110,6 +128,7 @@ else:
         completed)
             log "Backup completed successfully (all parts exported)"
             nbcurl -sf "$DAEMON/backup/status/clear" > /dev/null 2>&1 || true
+            run_offsite
             exit 0
             ;;
         failed)

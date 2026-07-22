@@ -65,6 +65,17 @@ export GOMAXPROCS="$RESTIC_CPUS"   # after sourcing, so /etc/default can overrid
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] offsite: $*"; }
 
+# Prevent overlapping runs. The first seed takes days, so without this the
+# nightly cron (which chains into this script) would stack a second restic on
+# top of the running one -- doubling CPU and thrashing the repo. Grab a
+# non-blocking lock; if another run holds it, exit 0 so the caller sees success.
+LOCK="${LOCK:-/run/nextbox-offsite.lock}"
+exec 9>"$LOCK" || { log "ERROR: cannot open lock file $LOCK" >&2; exit 1; }
+if ! flock -n 9; then
+    log "another off-site run is already in progress; skipping this one"
+    exit 0
+fi
+
 # Be a good citizen: lowest CPU priority + idle IO class so the nightly upload
 # never starves Nextcloud or the disk. We exec restic's *absolute path* (set in
 # preflight): nice/ionice run a real binary, so the shell builtin `command`

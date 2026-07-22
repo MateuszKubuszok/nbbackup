@@ -190,6 +190,7 @@ Override defaults in `/etc/default/nextbox-offsite` (sourced by the script):
 
 ```sh
 LIMIT_UPLOAD=4096        # upload cap in KiB/s (0 = unlimited); raise once seeded
+RESTIC_CPUS=2            # CPU cores restic may use (default: half); 1 = most responsive
 KEEP_DAILY=7             # retention: forget runs nightly (cheap, no repack)
 KEEP_WEEKLY=5
 KEEP_MONTHLY=12
@@ -198,6 +199,14 @@ PRUNE_DOW=7              # prune + integrity check run only on this weekday (Sun
 PRUNE_MAX_REPACK=5G      # cap bytes repacked per prune (prune re-uploads packs)
 RESTIC_COMPRESSION=auto  # "max" trades Pi CPU for fewer bytes over the uplink
 ```
+
+> **CPU, not just priority.** The script runs restic under `nice`/`ionice`, but
+> those only govern *contention* — restic's compression + hashing + encryption
+> will still peg **every** core, which makes Nextcloud sluggish during the
+> multi-day seed. `RESTIC_CPUS` caps restic (via `GOMAXPROCS`) to a subset of
+> cores so the rest stay free; it defaults to half. To rein in an *already
+> running* seed without restarting it, pin it live:
+> `sudo taskset -a -cp 0-1 "$(pgrep -x restic)"`.
 
 `forget` (delete old snapshots — metadata only, cheap) runs every night; `prune`
 (actually reclaim space, which repacks and re-uploads over the slow link) is

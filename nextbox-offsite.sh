@@ -36,6 +36,14 @@ export RCLONE_CONFIG="${RCLONE_CONFIG:-/root/.config/rclone/rclone.conf}"
 # set "max" to trade Pi CPU for fewer bytes over the slow pCloud uplink.
 export RESTIC_COMPRESSION="${RESTIC_COMPRESSION:-auto}"
 
+# Cap the CPU cores restic may saturate (compression + SHA-256 chunking + AES).
+# `nice` only re-prioritises; it does NOT stop restic pinning every core, which
+# makes Nextcloud unusable during the multi-day seed. GOMAXPROCS bounds restic's
+# parallel worker threads instead, leaving cores free. Default: half the cores
+# (min 1); set RESTIC_CPUS=1 for maximum responsiveness (slower backup).
+NCPU="$(nproc 2>/dev/null || echo 2)"
+RESTIC_CPUS="${RESTIC_CPUS:-$(( NCPU >= 2 ? NCPU / 2 : 1 ))}"
+
 # Upload throttle in KiB/s (0 = unlimited). The first seed runs for days and
 # bleeds into daytime, so cap it to keep the home uplink usable.
 LIMIT_UPLOAD="${LIMIT_UPLOAD:-4096}"
@@ -52,6 +60,7 @@ PRUNE_DOW="${PRUNE_DOW:-7}"                 # day-of-week to prune (1=Mon..7=Sun
 PRUNE_MAX_REPACK="${PRUNE_MAX_REPACK:-5G}" # cap repack volume per prune run
 
 [ -r /etc/default/nextbox-offsite ] && . /etc/default/nextbox-offsite
+export GOMAXPROCS="$RESTIC_CPUS"   # after sourcing, so /etc/default can override
 # ---------------------------------------------------------------------------
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] offsite: $*"; }
